@@ -149,20 +149,24 @@ def lambda_handler(event, context):
     for record in event["Records"]:
         process_record(record)
 
-    # Finish the asg lifecycle operation by sending a continue result
-    logger.info("Finishing ASG action")
-    message = json.loads(record["Sns"]["Message"])
-    if LIFECYCLE_KEY in message and ASG_KEY in message:
-        response = autoscaling.complete_lifecycle_action(
-            LifecycleHookName=message["LifecycleHookName"],
-            AutoScalingGroupName=message["AutoScalingGroupName"],
-            InstanceId=message["EC2InstanceId"],
-            LifecycleActionToken=message["LifecycleActionToken"],
-            LifecycleActionResult="CONTINUE",
-        )
-        logger.info("ASG action complete: %s", response)
-    else:
-        logger.error("No valid JSON message")
+        message = json.loads(record["Sns"]["Message"])
+        if LIFECYCLE_KEY in message and ASG_KEY in message:
+            # Finish the asg lifecycle operation by sending a continue result
+            logger.info("Finishing ASG action")
+            try:
+                response = autoscaling.complete_lifecycle_action(
+                    LifecycleHookName=message["LifecycleHookName"],
+                    AutoScalingGroupName=message["AutoScalingGroupName"],
+                    InstanceId=message["EC2InstanceId"],
+                    LifecycleActionToken=message["LifecycleActionToken"],
+                    LifecycleActionResult="CONTINUE",
+                )
+                logger.info("ASG action complete: %s", response)
+            except botocore.exceptions.ClientError as error:
+                logger.info("Ignoring complete lifecycle action error: %s", error)
+
+        else:
+            logger.error("No valid JSON message")
 
 
 # if invoked manually, assume someone pipes in a event json
