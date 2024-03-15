@@ -144,7 +144,8 @@ def process_record(record):
 # Main handler where the SNS events end up to
 # Events are bulked up, so process each Record individually
 def lambda_handler(event, context):
-    logger.info("Processing SNS event: " + json.dumps(event))
+    del context  # unused
+    logger.info("Processing SNS event: %s", json.dumps(event))
 
     for record in event["Records"]:
         process_record(record)
