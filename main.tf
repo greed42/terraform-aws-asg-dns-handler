@@ -2,68 +2,56 @@ resource "aws_sns_topic" "autoscale_handling" {
   name = "${var.vpc_name}-${var.autoscale_handler_unique_identifier}"
 }
 
+data "aws_iam_policy_document" "autoscale_handling" {
+  statement {
+    actions = [
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+    ]
+    resources = ["arn:aws:logs:*:*:*"]
+  }
+  statement {
+    actions = [
+      "autoscaling:DescribeTags",
+      "autoscaling:DescribeAutoScalingGroups",
+      "autoscaling:CompleteLifecycleAction",
+      "ec2:DescribeInstances",
+      "route53:GetHostedZone",
+      "ec2:CreateTags",
+    ]
+    resources = ["*"]
+  }
+  statement {
+    actions = [
+      "route53:ChangeResourceRecordSets",
+      "route53:ListResourceRecordSets",
+    ]
+    resources = ["arn:aws:route53:::hostedzone/${var.autoscale_route53zone_arn}"]
+  }
+}
+
 resource "aws_iam_role_policy" "autoscale_handling" {
   name = "${var.vpc_name}-${var.autoscale_handler_unique_identifier}"
   role = aws_iam_role.autoscale_handling.name
 
-  policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Action": [
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-      ],
-      "Effect": "Allow",
-      "Resource": "arn:aws:logs:*:*:*"
-    },
-    {
-      "Action":[
-        "autoscaling:DescribeTags",
-        "autoscaling:DescribeAutoScalingGroups",
-        "autoscaling:CompleteLifecycleAction",
-        "ec2:DescribeInstances",
-        "route53:GetHostedZone",
-        "ec2:CreateTags"
-      ],
-      "Effect":"Allow",
-      "Resource":"*"
-    },
-    {
-      "Action":[
-        "route53:ChangeResourceRecordSets",
-        "route53:ListResourceRecordSets"
-      ],
-      "Effect":"Allow",
-      "Resource":"arn:aws:route53:::hostedzone/${var.autoscale_route53zone_arn}"
-    }
-  ]
+  policy = data.aws_iam_policy_document.autoscale_handling.json
 }
-EOF
 
+data "aws_iam_policy_document" "autoscale_handling_role" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
 }
 
 resource "aws_iam_role" "autoscale_handling" {
   name = "${var.vpc_name}-${var.autoscale_handler_unique_identifier}"
 
-  assume_role_policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Action": "sts:AssumeRole",
-      "Principal": {
-        "Service": "lambda.amazonaws.com"
-      },
-      "Effect": "Allow",
-      "Sid": ""
-    }
-  ]
-}
-EOF
-
+  assume_role_policy = data.aws_iam_policy_document.autoscale_handling_role.json
 }
 
 resource "aws_iam_role" "lifecycle" {
@@ -138,4 +126,3 @@ resource "aws_sns_topic_subscription" "autoscale_handling" {
   protocol  = "lambda"
   endpoint  = aws_lambda_function.autoscale_handling.arn
 }
-
