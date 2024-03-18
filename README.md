@@ -2,47 +2,92 @@
 
 This Terraform module sets up everything necessary for dynamically setting hostnames following a certain pattern on instances spawned by AWS Auto Scaling Groups (ASGs).
 
-Learn more about our motivation to build this module in our blog post [Dynamic Route53 records for AWS Auto Scaling Groups with Terraform](https://underthehood.meltwater.com/blog/2020/02/07/dynamic-route53-records-for-aws-auto-scaling-groups-with-terraform/).
+This fork uses a different approach, and offers two modes of operation:
+
+1.  All IPs for instances in an auto-scaling group are added as `A`
+    (and `AAAA`) records for a single hostname associated with that
+    autoscaling group.
+
+    This is suitable for clients which can fail over using DNS, and
+    for whatever reason you do not want to set up a loadbalancer:
+    either the protocols are unsuitable or the cost of the
+    loadbalancer is overly high for the work the service needs to
+    perform.
+
+1.  The most recent instance in an auto-scaling group becomes the sole
+    `A` (and `AAAA`) record for that single hostname.
+
+    This is intended for a service which otherwise can run as a
+    singleton, but for which you would like "launch before terminate"
+    update semantics to reduce planned downtime.
+
+
+The consideration in the upstream blog post, [Dynamic Route53 records
+for AWS Auto Scaling Groups with
+Terraform](https://underthehood.meltwater.com/blog/2020/02/07/dynamic-route53-records-for-aws-auto-scaling-groups-with-terraform/),
+also applies. I am grateful for their work on this module and thank
+them for licensing it to the community.
 
 ## Maintainers
 
-This repository and the module it houses are maintained Foundation Missions A-Team.  Should you encounter issues or require changes to code maintained in this repository, please reachout through an issue that is part of this project.
+This repository and the module it houses is maintained by myself,
+Graham Reed, to solve a few particular problems which do not warrant
+load balancers. You are welcome to use it, and I will consider PRs,
+but I cannot offer actual support.
 
 ## Requirements
 
-- [Terraform](https://www.terraform.io/downloads.html) 0.12+ and [Terraform AWS provider](https://github.com/terraform-providers/terraform-provider-aws) 2.0+ use v2+ releases
-- [Terraform](https://www.terraform.io/downloads.html) 0.11 and below, [Terraform AWS provider](https://github.com/terraform-providers/terraform-provider-aws) 2.0.14 and below use v1.x releases
+- [Terraform](https://www.terraform.io/downloads.html) 1.6+
+- [Terraform AWS provider](https://github.com/terraform-providers/terraform-provider-aws) 5.0+
 
 ## How do I use it?
 
-Create an ASG and set the `asg:hostname_pattern` tag for example like this:
+Create an ASG and set the `asg:hostname` tag for example like this:
 
 ```
-asg-test-#instanceid.asg-handler-vpc.testing@Z3QP9GZSRL8IVA
+cant-use-a-loadbalancer.internal-vpc.testing@Z3QP9GZSRL8IVA
 ```
 
-`#instanceid`  is converted by a Lambda function within this module to the actual AWS instance_id that corresponds to the launched instance.  The `@` symbol is used to split the FQDN from the Route 53 zone_id.
-
-This could be interpolated in Terraform like this:
+Optionally, include the tag `asg:hostname_mode` tag with the value `multi` or
+`single`; `multi` is assumed if the tag is not present. `multi` mode
+will add all IPs to the hostname, `single` uses only the most recent
+instance (as determined by SNS messages to the lambda) to get the IP.
 
 ```hcl
-tag {
-  key                 = "asg:hostname_pattern"
-  value               = "${var.hostname_prefix}-#instanceid.${var.vpc_name}.testing@${var.internal_zone_id}"
-  propagate_at_launch = true
+data "aws_route53_zone" "internal" {
+  name         = "internal-vpc.testing"
+  private_zone = true
+}
+
+resource "autoscaling_group" "test" {
+  ...
+
+  tag {
+    key                 = "asg:hostname_pattern"
+    value               = "cant-user-a-loadbalancer.${data.aws_route53_zone.internal.name}@${data.aws_route53_zone.internal.id}"
+    propagate_at_launch = false
+  }
+  tag {
+    key                 = "asg:hostname_mode"
+    value               = "multi"
+    propagate_at_launch = false
+  }
 }
 ```
 
+Only the tags on the autoscaling group are read.
+
 Once you have your ASG set up, you can just invoke this module and point to it:
+
 ```hcl
 module "clever_name_autoscale_dns" {
   source  = meltwater/asg-dns-handler/aws"
   version = "~> 2.0"
-  
-  # use_public_ip      = true
-  # route53_record_ttl = 300
+
+  use_public_ip                       = false
+  route53_record_ttl                  = 60
   autoscale_handler_unique_identifier = "clever_name"
-  autoscale_route53zone_arn           = "ABCDEFGHIJ123"
+  autoscale_route53zone_arn           = data.aws_route53_zone.internal.id
   vpc_name                            = "my_vpc"
 }
 ```
@@ -57,14 +102,33 @@ The module sets up these things:
 
 The Lambda function then does the following:
 
-- Fetch the `asg:hostname_pattern` tag value from the ASG, and parse out the hostname and Route53 zone ID from it.
-- If it's an instance being **created**
-	- Fetch internal IP from EC2 API
-	- Create a Route53 record pointing the hostname to the IP
-	- Set the Name tag of the instance to the initial part of the generated hostname
-- If it's an instance being **deleted**
-	- Fetch the internal IP from the existing record from the Route53 API
-	- Delete the record
+- Fetch the `asg:hostname` tag value from the ASG, and parse out the hostname and Route53 zone ID from it.
+- Fetch the `asg:hostname_mode` tag value, or assume `multi` if it is not present.
+
+- If an instance is being **deleted**, the tag `asg:terminating` is
+  added with the value `true`. This is used so subsequent runs in
+  `multi` mode know to skip the instance. (But it's added regardless
+  of the mode.)
+
+- In `single` mode:
+  - Obtain the IP from the instance
+  - If it's an instance being **created**
+    - Create or replace a Route53 record pointing the hostname to the IP (UPSERT)
+  - If it's an instance being **deleted**
+    - Delete the Route53 record pointing to the IP (DELETE)
+    - This will (per the Route53 API) fail if the record is pointing to
+      a different IP, and that is intended.
+
+- In `multi` mode:
+  - Find the IP of all instances in the ASG except for those known to
+    be terminating (Those for which we receive a notification saying
+    so, or which already have an `asg:terminating=true` tag.)
+  - Find any current IPs of the hostname from Route53.
+  - If there are any changes...
+    - If there are current IPs, create or update the record
+      with the new addresses (UPSERT)
+    - If there are no current IPs (the last instance was terminated),
+      remove the record (DELETE)
 
 ## Setup
 

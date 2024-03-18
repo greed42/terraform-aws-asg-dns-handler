@@ -21,6 +21,6 @@ variable "autoscale_route53zone_arn" {
 
 variable "route53_record_ttl" {
   description = "TTL to use for the Route 53 Records created"
-  default     = 300
+  default     = 60
   type        = number
 }
