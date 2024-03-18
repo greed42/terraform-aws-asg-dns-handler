@@ -34,3 +34,8 @@ variable "ec2_resource_tags" {
   default = {}
   type    = map(set(string))
 }
+
+variable "route53_change_record_names" {
+  default = null
+  type    = set(string)
+}

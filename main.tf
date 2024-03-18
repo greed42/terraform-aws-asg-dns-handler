@@ -46,18 +46,37 @@ data "aws_iam_policy_document" "autoscale_handling" {
     }
   }
   statement {
-    actions = [
-      "route53:ChangeResourceRecordSets",
-      "route53:ListResourceRecordSets",
-    ]
+    actions   = ["route53:ListResourceRecordSets"]
     resources = ["arn:aws:route53:::hostedzone/${var.autoscale_route53zone_arn}"]
+  }
+  statement {
+    actions   = ["route53:ChangeResourceRecordSets"]
+    resources = ["arn:aws:route53:::hostedzone/${var.autoscale_route53zone_arn}"]
+
+    condition {
+      variable = "route53:ChangeResourceRecordSetsRecordTypes"
+      test     = "ForAllValues:StringEquals"
+      values = [
+        "A",
+        "AAAA",
+      ]
+    }
+
+    dynamic "condition" {
+      for_each = toset(var.route53_change_record_names == null ? [] : ["rr_name"])
+
+      content {
+        variable = "route53:ChangeResourceRecordSetsNormalizedRecordNames"
+        test     = "ForAllValues:StringLike"
+        values   = var.route53_change_record_names
+      }
+    }
   }
 }
 
 resource "aws_iam_role_policy" "autoscale_handling" {
-  name = "${var.vpc_name}-${var.autoscale_handler_unique_identifier}"
-  role = aws_iam_role.autoscale_handling.name
-
+  name   = "${var.vpc_name}-${var.autoscale_handler_unique_identifier}"
+  role   = aws_iam_role.autoscale_handling.name
   policy = data.aws_iam_policy_document.autoscale_handling.json
 }
 
