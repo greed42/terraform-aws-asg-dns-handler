@@ -29,3 +29,8 @@ variable "lambda_log_retention_in_days" {
   default = null
   type    = number
 }
+
+variable "ec2_resource_tags" {
+  default = {}
+  type    = map(set(string))
+}

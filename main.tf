@@ -22,9 +22,28 @@ data "aws_iam_policy_document" "autoscale_handling" {
       "autoscaling:CompleteLifecycleAction",
       "ec2:DescribeInstances",
       "route53:GetHostedZone",
-      "ec2:CreateTags",
     ]
     resources = ["*"]
+  }
+  statement {
+    actions   = ["ec2:CreateTags"]
+    resources = ["arn:aws:ec2:*:*:instance/*"]
+
+    condition {
+      variable = "aws:TagKeys"
+      test     = "ForAllValues:StringEquals"
+      values   = ["asg:terminating"]
+    }
+
+    dynamic "condition" {
+      for_each = var.ec2_resource_tags
+
+      content {
+        variable = "ec2:ResourceTag/${condition.key}"
+        test     = "StringEquals"
+        values   = condition.value
+      }
+    }
   }
   statement {
     actions = [
