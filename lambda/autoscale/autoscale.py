@@ -119,6 +119,7 @@ def process_message(message):
         logger.error(
             "Encountered unknown event type: %s", message["LifecycleTransition"]
         )
+        return
 
     asg_name = message["AutoScalingGroupName"]
     instance_id = message["EC2InstanceId"]
