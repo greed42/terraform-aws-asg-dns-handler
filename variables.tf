@@ -24,3 +24,8 @@ variable "route53_record_ttl" {
   default     = 60
   type        = number
 }
+
+variable "lambda_log_retention_in_days" {
+  default = null
+  type    = number
+}

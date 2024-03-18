@@ -2,14 +2,18 @@ resource "aws_sns_topic" "autoscale_handling" {
   name = "${var.vpc_name}-${var.autoscale_handler_unique_identifier}"
 }
 
+resource "aws_cloudwatch_log_group" "autoscale_handling" {
+  name              = "/aws/lambda/${aws_lambda_function.autoscale_handling.function_name}"
+  retention_in_days = var.lambda_log_retention_in_days
+}
+
 data "aws_iam_policy_document" "autoscale_handling" {
   statement {
     actions = [
-      "logs:CreateLogGroup",
       "logs:CreateLogStream",
       "logs:PutLogEvents",
     ]
-    resources = ["arn:aws:logs:*:*:*"]
+    resources = ["${aws_cloudwatch_log_group.autoscale_handling.arn}:*"]
   }
   statement {
     actions = [
