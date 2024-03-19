@@ -66,7 +66,7 @@ class HostnameConfig(NamedTuple):
         # We MUST have a hostname tag, we MAY have a mode.
         hostname_zone = tags.get(HOSTNAME_TAG_NAME, "").split("@", 1)
 
-        if not hostname_zone:
+        if not hostname_zone[0]:
             logger.warning("Cannot find %s tag for ASG %s", HOSTNAME_TAG_NAME, asg_name)
             return None
 
