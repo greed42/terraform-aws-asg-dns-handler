@@ -391,11 +391,6 @@ def process_message(message):
     change_records(old_ipv6s, ipv6s, "AAAA")
 
 
-# Picks out the message from a SNS message and deserializes it
-def process_record(record):
-    process_message(json.loads(record["Sns"]["Message"]))
-
-
 # Main handler where the SNS events end up to
 # Events are bulked up, so process each Record individually
 def lambda_handler(event, context):
@@ -403,9 +398,13 @@ def lambda_handler(event, context):
     logger.info("Processing SNS event: %s", json.dumps(event))
 
     for record in event["Records"]:
-        process_record(record)
-
         message = json.loads(record["Sns"]["Message"])
+        if message.get("Event") == "autoscaling:TEST_NOTIFICATION":
+            logging.info("Received test from group %s", message["AutoScalingGroupName"])
+            continue
+
+        process_message(message)
+
         if LIFECYCLE_KEY in message and ASG_KEY in message:
             # Finish the asg lifecycle operation by sending a continue result
             logger.info("Finishing ASG action")
