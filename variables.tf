@@ -39,3 +39,8 @@ variable "route53_change_record_names" {
   default = null
   type    = set(string)
 }
+
+variable "python_version" {
+  default = "3.11"
+  type    = string
+}
