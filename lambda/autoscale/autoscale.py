@@ -15,6 +15,9 @@ ec2 = boto3.client("ec2")
 route53 = boto3.client("route53")
 
 HOSTNAME_TAG_NAME = "asg:hostname"
+PUBLIC_IPV4_TAG_NAME = "asg:public_ipv4"
+PUBLIC_IPV4_DEFAULT = "true" if os.getenv("USE_PUBLIC_IP") == "true" else "false"
+PUBLIC_IPV4_VALID = frozenset(["true", "false"])
 TERMINATING_TAG_NAME = "asg:terminating"
 TERMINATING_TAG_VALUE = "true"
 MODE_TAG_NAME = "asg:hostname_mode"
@@ -26,10 +29,7 @@ MODES_VALID = frozenset([MODE_SINGLE, MODE_MULTI])
 LIFECYCLE_KEY = "LifecycleHookName"
 ASG_KEY = "AutoScalingGroupName"
 
-USE_PUBLIC_IP = os.getenv("USE_PUBLIC_IP") == "true"
 ROUTE53_TTL = int(os.getenv("ROUTE53_TTL", "60"))
-IPV4_FIELD = "PublicIpAddress" if USE_PUBLIC_IP else "PrivateIpAddress"
-IPV6_FIELD = "Ipv6Address"
 
 
 class HostnameConfig(NamedTuple):
@@ -37,6 +37,7 @@ class HostnameConfig(NamedTuple):
     hostname: str
     zone_id: str
     mode: str
+    public_ipv4: bool
 
     @property
     def is_single(self) -> bool:
@@ -45,6 +46,15 @@ class HostnameConfig(NamedTuple):
     @property
     def canonical_hostname(self) -> str:
         return f'{self.hostname.rstrip(".")}.'
+
+    @property
+    def ipv4_field(self) -> str:
+        return "PublicIpAddress" if self.public_ipv4 else "PrivateIpAddress"
+
+    @property
+    def ipv6_field(self) -> str:
+        del self  # unused
+        return "Ipv6Address"
 
     @classmethod
     def from_asg_name(cls, asg_name: str) -> Optional["HostnameConfig"]:
@@ -55,7 +65,7 @@ class HostnameConfig(NamedTuple):
         for response in autoscaling.get_paginator("describe_tags").paginate(
             Filters=[
                 {"Name": "auto-scaling-group", "Values": [asg_name]},
-                {"Name": "key", "Values": [HOSTNAME_TAG_NAME, MODE_TAG_NAME]},
+                {"Name": "key", "Values": [HOSTNAME_TAG_NAME, MODE_TAG_NAME, PUBLIC_IPV4_TAG_NAME]},
             ],
         ):
             for tag in response.get("Tags", []):
@@ -89,87 +99,82 @@ class HostnameConfig(NamedTuple):
             )
             return None
 
+        public_ipv4 = tags.get(PUBLIC_IPV4_TAG_NAME, PUBLIC_IPV4_DEFAULT)
+        if public_ipv4 not in PUBLIC_IPV4_VALID:
+            logger.error(
+                "Tag %s for ASG %s value %s is an unknown Public IPv4 boolean.",
+                PUBLIC_IPV4_TAG_NAME,
+                asg_name,
+                public_ipv4,
+            )
+            return None
+
         hostname, zone = hostname_zone
 
-        return cls(asg_name, hostname, zone, mode)
+        return cls(asg_name, hostname, zone, mode, public_ipv4 == "true")
 
+    def fetch_instance_ips(self, ignore_ids: Collection[str]) -> Tuple[Set[str], Set[str]]:
+        ipv4s = set()
+        ipv6s = set()
 
-def fetch_instance_ips(
-    asg_name: str, ignore_ids: Collection[str]
-) -> Tuple[Set[str], Set[str]]:
-    ipv4s = set()
-    ipv6s = set()
+        for response in ec2.get_paginator("describe_instances").paginate(
+            Filters=[
+                {
+                    "Name": "tag:aws:autoscaling:groupName",
+                    "Values": [self.asg_name],
+                },
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["running"],
+                },
+            ]
+        ):
+            for reservation in response["Reservations"]:
+                for instance in reservation["Instances"]:
+                    if instance["InstanceId"] in ignore_ids:
+                        logging.info("Ignoring instance-id %s", instance["InstanceId"])
+                        continue
 
-    for response in ec2.get_paginator("describe_instances").paginate(
-        Filters=[
-            {
-                "Name": "tag:aws:autoscaling:groupName",
-                "Values": [asg_name],
-            },
-            {
-                "Name": "instance-state-name",
-                "Values": ["running"],
-            },
-        ]
-    ):
-        for reservation in response["Reservations"]:
-            for instance in reservation["Instances"]:
-                if instance["InstanceId"] in ignore_ids:
-                    logging.info("Ignoring instance-id %s", instance["InstanceId"])
-                    continue
+                    if any(
+                        tag["Key"] == TERMINATING_TAG_NAME and tag["Value"] == TERMINATING_TAG_VALUE
+                        for tag in instance["Tags"]
+                    ):
+                        logging.info(
+                            "Instance-id %s is tagged for termination",
+                            instance["InstanceId"],
+                        )
+                        continue
 
-                if any(
-                    tag["Key"] == TERMINATING_TAG_NAME
-                    and tag["Value"] == TERMINATING_TAG_VALUE
-                    for tag in instance["Tags"]
-                ):
-                    logging.info(
-                        "Instance-id %s is tagged for termination",
-                        instance["InstanceId"],
-                    )
-                    continue
+                    logger.info("Fetching IP for instance-id: %s", instance["InstanceId"])
 
-                logger.info("Fetching IP for instance-id: %s", instance["InstanceId"])
+                    if (ipv4 := instance.get(self.ipv4_field)) is not None:
+                        logging.info("Found instance-id %s IPv4 %s", instance["InstanceId"], ipv4)
+                        ipv4s.add(ipv4)
 
-                if (ipv4 := instance.get(IPV4_FIELD)) is not None:
-                    logging.info(
-                        "Found instance-id %s IPv4 %s", instance["InstanceId"], ipv4
-                    )
-                    ipv4s.add(ipv4)
+                    if (ipv6 := instance.get(self.ipv6_field)) is not None:
+                        logging.info("Found instance-id %s IPv6 %s", instance["InstanceId"], ipv6)
+                        ipv6s.add(ipv6)
 
-                if (ipv6 := instance.get(IPV6_FIELD)) is not None:
-                    logging.info(
-                        "Found instance-id %s IPv6 %s", instance["InstanceId"], ipv6
-                    )
-                    ipv6s.add(ipv6)
+        return ipv4s, ipv6s
 
-    return ipv4s, ipv6s
+    def fetch_ip_from_ec2(self, instance_id: str) -> Tuple[Set[str], Set[str]]:
+        ipv4s = set()
+        ipv6s = set()
 
+        for response in ec2.get_paginator("describe_instances").paginate(InstanceIds=[instance_id]):
+            for reservation in response["Reservations"]:
+                for instance in reservation["Instances"]:
+                    logger.info("Fetching IP for instance-id: %s", instance["InstanceId"])
 
-def fetch_ip_from_ec2(instance_id: str) -> Tuple[Set[str], Set[str]]:
-    ipv4s = set()
-    ipv6s = set()
+                    if (ipv4 := instance.get(self.ipv4_field)) is not None:
+                        logging.info("Found instance-id %s IPv4 %s", instance["InstanceId"], ipv4)
+                        ipv4s.add(ipv4)
 
-    for response in ec2.get_paginator("describe_instances").paginate(
-        InstanceIds=[instance_id]
-    ):
-        for reservation in response["Reservations"]:
-            for instance in reservation["Instances"]:
-                logger.info("Fetching IP for instance-id: %s", instance["InstanceId"])
+                    if (ipv6 := instance.get(self.ipv6_field)) is not None:
+                        logging.info("Found instance-id %s IPv6 %s", instance["InstanceId"], ipv6)
+                        ipv6s.add(ipv6)
 
-                if (ipv4 := instance.get(IPV4_FIELD)) is not None:
-                    logging.info(
-                        "Found instance-id %s IPv4 %s", instance["InstanceId"], ipv4
-                    )
-                    ipv4s.add(ipv4)
-
-                if (ipv6 := instance.get(IPV6_FIELD)) is not None:
-                    logging.info(
-                        "Found instance-id %s IPv6 %s", instance["InstanceId"], ipv6
-                    )
-                    ipv6s.add(ipv6)
-
-    return ipv4s, ipv6s
+        return ipv4s, ipv6s
 
 
 def set_terminating_tag(instance_id):
@@ -191,9 +196,7 @@ def set_terminating_tag(instance_id):
 
 
 # Fetches values of an RR from route53 API
-def fetch_values_from_route53(
-    config: HostnameConfig, record_type: str = "A"
-) -> Set[str]:
+def fetch_values_from_route53(config: HostnameConfig, record_type: str = "A") -> Set[str]:
     logger.info("Fetching IP for hostname: %s", config.hostname)
 
     values = set()
@@ -220,9 +223,7 @@ def fetch_values_from_route53(
             )
             continue
         if rr_set["Type"] != record_type:
-            logging.debug(
-                "Undesired RR set type: %s (wanted %s)", rr_set["Type"], record_type
-            )
+            logging.debug("Undesired RR set type: %s (wanted %s)", rr_set["Type"], record_type)
             continue
 
         for rr in rr_set["ResourceRecords"]:
@@ -296,9 +297,7 @@ def process_message(message):
     ):
         terminate_ids = {message["EC2InstanceId"]}
     else:
-        logger.error(
-            "Encountered unknown event type: %s", message["LifecycleTransition"]
-        )
+        logger.error("Encountered unknown event type: %s", message["LifecycleTransition"])
         return
 
     logger.info("Processing message: %s", message)
@@ -318,20 +317,14 @@ def process_message(message):
 
     def change_records(old: Set[str], new: Set[str], record_type: str = "A"):
         if old == new:
-            logging.info(
-                "No change in %s %s records %s", config.hostname, record_type, new
-            )
+            logging.info("No change in %s %s records %s", config.hostname, record_type, new)
             return
 
         if new:
             if add := new - old:
-                logging.info(
-                    "Adding %s %s records %s", config.hostname, record_type, add
-                )
+                logging.info("Adding %s %s records %s", config.hostname, record_type, add)
             if remove := old - new:
-                logging.info(
-                    "Removing %s %s records %s", config.hostname, record_type, remove
-                )
+                logging.info("Removing %s %s records %s", config.hostname, record_type, remove)
 
             update_record(config, new, "UPSERT", record_type)
             return
@@ -348,7 +341,7 @@ def process_message(message):
         # be updated with launch_before_terminate so reduce the visible
         # downtime during maintenance.
         for instance_id in launch_ids:
-            ipv4s, ipv6s = fetch_ip_from_ec2(instance_id)
+            ipv4s, ipv6s = config.fetch_ip_from_ec2(instance_id)
             # In this mode, we cannot tell if we went from a "has IPv6" to "no IPv6"
             # situation: we rely on the terminating event to delete the address properly.
             # (Same for IPv4 really.)
@@ -364,16 +357,13 @@ def process_message(message):
         # over" the hostname before this one termintes, the name will remain
         # pointing at that instance.
         for instance_id in terminate_ids:
-            ipv4s, ipv6s = fetch_ip_from_ec2(instance_id)
+            ipv4s, ipv6s = config.fetch_ip_from_ec2(instance_id)
             for old, record_type in ((ipv4s, "A"), (ipv6s, "AAAA")):
                 if old:
                     try:
                         change_records(old, set(), record_type)
                     except botocore.exceptions.ClientError as error:
-                        if (
-                            error.response.get("Error", {}).get("Code")
-                            != "InvalidChangeBatch"
-                        ):
+                        if error.response.get("Error", {}).get("Code") != "InvalidChangeBatch":
                             raise
                         logging.info(
                             "%s %s records have already been changed",
@@ -385,7 +375,7 @@ def process_message(message):
 
     # Multi mode: The hostname references all running instances.
 
-    ipv4s, ipv6s = fetch_instance_ips(asg_name, terminate_ids)
+    ipv4s, ipv6s = config.fetch_instance_ips(terminate_ids)
 
     change_records(old_ipv4s, ipv4s)
     change_records(old_ipv6s, ipv6s, "AAAA")
